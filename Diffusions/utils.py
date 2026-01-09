@@ -113,7 +113,7 @@ def validate_one_epoch(model, scheduler, dataloader, device, epoch):
 def visualize_reverse_process(
     model, 
     scheduler, 
-    shape=(4, 1, 28, 28),
+    shape=(1, 1, 28, 28),
     sampler='ddpm',
     num_ddim_steps=50,
     save_path=None,
@@ -170,7 +170,18 @@ def visualize_reverse_process(
         img = (img + 1) / 2
         img = np.clip(img, 0, 1)
         
-        ax.imshow(img, cmap='gray')
+        # Handle different channel counts
+        if len(img.shape) == 3 and img.shape[0] == 3:
+            # RGB image: transpose from (C, H, W) to (H, W, C)
+            img = img.transpose(1, 2, 0)
+            ax.imshow(img)
+        elif len(img.shape) == 2:
+            # Grayscale image: already 2D
+            ax.imshow(img, cmap='gray')
+        else:
+            # Single channel: squeeze to 2D
+            img = img.squeeze()
+            ax.imshow(img, cmap='gray')
         
         # Calculate actual step number
         if sampler == 'ddpm':
@@ -188,7 +199,8 @@ def visualize_reverse_process(
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"Saved visualization to {save_path}")
     
-    plt.show()
+    plt.clf()
+    plt.close()
 
 
 @torch.no_grad()
@@ -199,6 +211,7 @@ def generate_samples(
     sampler='ddim',
     num_ddim_steps=50,
     eta=0.0,
+    shape=None,
     device=None,
     save_path=None
 ):
@@ -212,6 +225,7 @@ def generate_samples(
         sampler: 'ddpm' or 'ddim'
         num_ddim_steps: Number of DDIM steps
         eta: DDIM stochasticity parameter
+        shape: Shape of images (B, C, H, W). If None, infers from model or uses default
         device: Device to use
         save_path: Path to save the figure
     
@@ -226,7 +240,15 @@ def generate_samples(
     if device is None:
         device = next(model.parameters()).device
     
-    shape = (num_samples, 1, 28, 28)  # Assuming FashionMNIST
+    # Infer shape if not provided
+    if shape is None:
+        # Try to infer from model's expected input
+        # Default to FashionMNIST shape if can't infer
+        in_channels = model.in_channels if hasattr(model, 'in_channels') else 1
+        shape = (num_samples, in_channels, 28, 28)
+    else:
+        # Ensure batch size matches num_samples
+        shape = (num_samples,) + shape[1:]
     
     print(f"Generating {num_samples} samples using {sampler.upper()}...")
     
@@ -255,7 +277,19 @@ def generate_samples(
     for i, ax in enumerate(axes):
         if i < num_samples:
             img = samples[i].squeeze().numpy()
-            ax.imshow(img, cmap='gray')
+            
+            # Handle different channel counts
+            if len(img.shape) == 3 and img.shape[0] == 3:
+                # RGB image: transpose from (C, H, W) to (H, W, C)
+                img = img.transpose(1, 2, 0)
+                ax.imshow(img)
+            elif len(img.shape) == 2:
+                # Grayscale image: already 2D
+                ax.imshow(img, cmap='gray')
+            else:
+                # Single channel: squeeze to 2D
+                img = img.squeeze()
+                ax.imshow(img, cmap='gray')
         ax.axis('off')
     
     title = f"Generated Samples ({sampler.upper()}"
@@ -269,7 +303,8 @@ def generate_samples(
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"Saved samples to {save_path}")
     
-    plt.show()
+    plt.clf()
+    plt.close()
     
     return samples
 

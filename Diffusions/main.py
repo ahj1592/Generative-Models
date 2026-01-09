@@ -14,7 +14,7 @@ import torch.optim as optim
 from models import StandardUNet
 from ddpm import DiffusionScheduler, p_sample_loop
 from ddim import ddim_sample_loop
-from dataset import get_fashion_mnist_loaders
+from dataset import get_fashion_mnist_loaders, get_mnist_loaders, get_oxford_flowers_loaders
 from utils import (
     train_one_epoch, 
     validate_one_epoch, 
@@ -47,9 +47,18 @@ def get_args():
     parser.add_argument('--ddim_steps', type=int, default=50, help='Number of DDIM sampling steps')
     parser.add_argument('--eta', type=float, default=0.0, help='DDIM eta parameter (0=deterministic)')
     
+    # Dataset arguments
+    parser.add_argument('--dataset', type=str, default='fashion_mnist', 
+                       choices=['fashion_mnist', 'mnist', 'oxford_flowers'],
+                       help='Dataset to use')
+    parser.add_argument('--image_size', type=int, default=None,
+                       help='Image size (for Oxford Flowers, default: 64)')
+    
     # Other arguments
     parser.add_argument('--device', type=str, default='auto', help='Device (cuda/cpu/mps/auto)')
     parser.add_argument('--checkpoint', type=str, default=None, help='Path to checkpoint to resume from')
+    parser.add_argument('--resume_from_epoch', type=int, default=None,
+                       help='Epoch to resume from (overrides checkpoint epoch if specified)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
     parser.add_argument('--sample_only', action='store_true', help='Only generate samples (no training)')
     parser.add_argument('--num_samples', type=int, default=16, help='Number of samples to generate')
@@ -76,10 +85,28 @@ def main():
     device = get_device(args.device)
     print(f"Using device: {device}")
     
+    # Determine dataset-specific parameters
+    if args.dataset == 'oxford_flowers':
+        in_channels = 3  # RGB
+        out_channels = 3
+        image_size = args.image_size if args.image_size else 64
+        default_batch_size = 32  # Smaller batch for larger images
+    elif args.dataset in ['fashion_mnist', 'mnist']:
+        in_channels = 1  # Grayscale
+        out_channels = 1
+        image_size = 28
+        default_batch_size = 128
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+    
+    # Adjust batch size if not specified and using Oxford Flowers
+    if args.dataset == 'oxford_flowers' and args.batch_size == 128:
+        print(f"Note: Using smaller default batch size for Oxford Flowers")
+    
     # Create model
     model = StandardUNet(
-        in_channels=1,
-        out_channels=1,
+        in_channels=in_channels,
+        out_channels=out_channels,
         base_channels=args.base_channels,
         channel_mults=(1, 2, 4),
         num_res_blocks=args.num_res_blocks,
@@ -87,6 +114,7 @@ def main():
     ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Dataset: {args.dataset}, Image size: {image_size}x{image_size}, Channels: {in_channels}")
     
     # Create scheduler
     scheduler = DiffusionScheduler(
@@ -100,18 +128,32 @@ def main():
     # Load checkpoint if provided
     start_epoch = 0
     if args.checkpoint:
-        start_epoch, _ = load_checkpoint(model, optimizer, args.checkpoint, device)
-        start_epoch += 1  # Start from next epoch
+        checkpoint_epoch, _ = load_checkpoint(model, optimizer, args.checkpoint, device)
+        
+        if args.resume_from_epoch is not None:
+            if args.resume_from_epoch < checkpoint_epoch:
+                print(f"Warning: resume_from_epoch ({args.resume_from_epoch}) < checkpoint epoch ({checkpoint_epoch})")
+                print(f"Starting from checkpoint epoch + 1 ({checkpoint_epoch + 1}) instead")
+                start_epoch = checkpoint_epoch + 1
+            else:
+                start_epoch = args.resume_from_epoch
+                print(f"Resuming from epoch {start_epoch} (checkpoint was at epoch {checkpoint_epoch})")
+        else:
+            start_epoch = checkpoint_epoch + 1  # Start from next epoch (default behavior)
+            print(f"Starting from epoch {start_epoch} (checkpoint was at epoch {checkpoint_epoch})")
     
     # Sample only mode
     if args.sample_only:
         print("\n=== Generating Samples ===")
+        
+        shape = (args.num_samples, in_channels, image_size, image_size)
         
         print("\n--- DDPM Sampling ---")
         generate_samples(
             model, scheduler, 
             num_samples=args.num_samples,
             sampler='ddpm',
+            shape=shape,
             device=device,
             save_path='samples_ddpm.png'
         )
@@ -123,6 +165,7 @@ def main():
             sampler='ddim',
             num_ddim_steps=args.ddim_steps,
             eta=args.eta,
+            shape=shape,
             device=device,
             save_path='samples_ddim.png'
         )
@@ -131,9 +174,21 @@ def main():
     
     # Load data
     print("\n=== Loading Data ===")
-    train_loader, valid_loader, _ = get_fashion_mnist_loaders(
-        batch_size=args.batch_size
-    )
+    if args.dataset == 'fashion_mnist':
+        train_loader, valid_loader, _ = get_fashion_mnist_loaders(
+            batch_size=args.batch_size
+        )
+    elif args.dataset == 'mnist':
+        train_loader, valid_loader, _ = get_mnist_loaders(
+            batch_size=args.batch_size
+        )
+    elif args.dataset == 'oxford_flowers':
+        train_loader, valid_loader, _ = get_oxford_flowers_loaders(
+            batch_size=args.batch_size,
+            image_size=image_size
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
     
     # Training loop
     print("\n=== Training ===")
@@ -170,11 +225,13 @@ def main():
             print(f"\n--- Generating samples at epoch {epoch + 1} ---")
             
             # DDIM is faster for periodic visualization
+            shape = (8, in_channels, image_size, image_size)
             generate_samples(
                 model, scheduler,
                 num_samples=8,
                 sampler='ddim',
                 num_ddim_steps=args.ddim_steps,
+                shape=shape,
                 device=device,
                 save_path=f"{args.save_dir}/samples_epoch_{epoch+1}.png"
             )
@@ -182,25 +239,29 @@ def main():
     # Final sampling comparison
     print("\n=== Final Sampling Comparison ===")
     
+    test_shape = (4, in_channels, image_size, image_size)
+    
     print("\n--- DDPM Sampling (1000 steps) ---")
     import time
     start_time = time.time()
-    _ = p_sample_loop(model, scheduler, (4, 1, 28, 28), device=device)
+    _ = p_sample_loop(model, scheduler, test_shape, device=device)
     ddpm_time = time.time() - start_time
     print(f"DDPM sampling time: {ddpm_time:.2f}s")
     
     print(f"\n--- DDIM Sampling ({args.ddim_steps} steps) ---")
     start_time = time.time()
-    _ = ddim_sample_loop(model, scheduler, (4, 1, 28, 28), num_ddim_steps=args.ddim_steps, device=device)
+    _ = ddim_sample_loop(model, scheduler, test_shape, num_ddim_steps=args.ddim_steps, device=device)
     ddim_time = time.time() - start_time
     print(f"DDIM sampling time: {ddim_time:.2f}s")
     print(f"Speedup: {ddpm_time / ddim_time:.1f}x")
     
     # Generate final samples
+    final_shape = (16, in_channels, image_size, image_size)
     generate_samples(
         model, scheduler,
         num_samples=16,
         sampler='ddpm',
+        shape=final_shape,
         device=device,
         save_path=f"{args.save_dir}/final_samples_ddpm.png"
     )
@@ -210,6 +271,7 @@ def main():
         num_samples=16,
         sampler='ddim',
         num_ddim_steps=args.ddim_steps,
+        shape=final_shape,
         device=device,
         save_path=f"{args.save_dir}/final_samples_ddim.png"
     )
@@ -218,7 +280,7 @@ def main():
     print("\n--- Visualizing Reverse Process ---")
     visualize_reverse_process(
         model, scheduler,
-        shape=(1, 1, 28, 28),
+        shape=(1, in_channels, image_size, image_size),
         sampler='ddim',
         num_ddim_steps=args.ddim_steps,
         save_path=f"{args.save_dir}/reverse_process_ddim.png",
